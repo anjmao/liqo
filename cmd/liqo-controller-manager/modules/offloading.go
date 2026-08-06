@@ -21,6 +21,7 @@ import (
 	"time"
 
 	certificates "k8s.io/api/certificates/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
@@ -40,6 +41,7 @@ import (
 	liqostorageprovisioner "github.com/liqotech/liqo/pkg/liqo-controller-manager/offloading/storageprovisioner"
 	virtualnodectrl "github.com/liqotech/liqo/pkg/liqo-controller-manager/offloading/virtualnode-controller"
 	tenantnamespace "github.com/liqotech/liqo/pkg/tenantNamespace"
+	argsutils "github.com/liqotech/liqo/pkg/utils/args"
 	"github.com/liqotech/liqo/pkg/utils/csr"
 )
 
@@ -57,11 +59,23 @@ type OffloadingOption struct {
 	ShadowEndpointSliceWorkers  int
 	DenyDirectConnections       bool
 	ResyncPeriod                time.Duration
+	LiqoNamespace               string
+	LocalPodCIDRs               []string
+	VkOptionsDefaultTemplate    *corev1.ObjectReference
 }
 
 // NewOffloadingOption creates a new OffloadingOption with the given parameters.
 func NewOffloadingOption(clientset *kubernetes.Clientset, localClusterID liqov1beta1.ClusterID,
-	namespaceManager tenantnamespace.Manager, opts *liqocontrollermanager.Options) *OffloadingOption {
+	namespaceManager tenantnamespace.Manager, opts *liqocontrollermanager.Options) (*OffloadingOption, error) {
+	var vkOptsDefaultTemplateRef *corev1.ObjectReference
+	if opts.VkOptionsDefaultTemplate != "" {
+		ref, err := argsutils.GetObjectRefFromNamespacedName(opts.VkOptionsDefaultTemplate)
+		if err != nil {
+			return nil, fmt.Errorf("invalid namespaced name for virtual-kubelet options template %q: %w", opts.VkOptionsDefaultTemplate, err)
+		}
+		vkOptsDefaultTemplateRef = ref
+	}
+
 	return &OffloadingOption{
 		Clientset:                   clientset,
 		LocalClusterID:              localClusterID,
@@ -75,7 +89,10 @@ func NewOffloadingOption(clientset *kubernetes.Clientset, localClusterID liqov1b
 		ShadowEndpointSliceWorkers:  opts.ShadowEndpointSliceWorkers,
 		DenyDirectConnections:       opts.DenyDirectConnections,
 		ResyncPeriod:                opts.ResyncPeriod,
-	}
+		LiqoNamespace:               opts.LiqoNamespace,
+		LocalPodCIDRs:               opts.LocalPodCIDRs,
+		VkOptionsDefaultTemplate:    vkOptsDefaultTemplateRef,
+	}, nil
 }
 
 // SetupOffloadingModule setup the offloading module and initializes its controllers.
@@ -87,6 +104,9 @@ func SetupOffloadingModule(ctx context.Context, mgr manager.Manager, opts *Offlo
 		mgr.GetEventRecorderFor("virtualnode-controller"),
 		opts.LocalClusterID,
 		opts.NamespaceManager,
+		opts.LiqoNamespace,
+		opts.LocalPodCIDRs,
+		opts.VkOptionsDefaultTemplate,
 	)
 	if err != nil {
 		klog.Errorf("Unable to create the virtualnode reconciler: %v", err)

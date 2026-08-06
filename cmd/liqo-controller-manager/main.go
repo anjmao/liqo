@@ -53,7 +53,6 @@ import (
 	foreignclustercontroller "github.com/liqotech/liqo/pkg/liqo-controller-manager/core/foreigncluster-controller"
 	ipmapping "github.com/liqotech/liqo/pkg/liqo-controller-manager/ipmapping"
 	quotacreatorcontroller "github.com/liqotech/liqo/pkg/liqo-controller-manager/quotacreator-controller"
-	virtualnodecreatorcontroller "github.com/liqotech/liqo/pkg/liqo-controller-manager/virtualnodecreator-controller"
 	tenantnamespace "github.com/liqotech/liqo/pkg/tenantNamespace"
 	dynamicutils "github.com/liqotech/liqo/pkg/utils/dynamic"
 	liqoerrors "github.com/liqotech/liqo/pkg/utils/errors"
@@ -217,7 +216,10 @@ func run(cmd *cobra.Command, _ []string) error {
 
 	// OFFLOADING MODULE
 	if opts.OffloadingEnabled {
-		offOpts := modules.NewOffloadingOption(clientset, clusterID, namespaceManager, opts)
+		offOpts, err := modules.NewOffloadingOption(clientset, clusterID, namespaceManager, opts)
+		if err != nil {
+			return fmt.Errorf("unable to create the offloading options: %w", err)
+		}
 
 		if err := modules.SetupOffloadingModule(cmd.Context(), mgr, offOpts); err != nil {
 			return fmt.Errorf("unable to setup the offloading module: %w", err)
@@ -228,13 +230,6 @@ func run(cmd *cobra.Command, _ []string) error {
 
 	// AUTHENTICATION MODULE & OFFLOADING MODULE
 	if opts.AuthenticationEnabled && opts.OffloadingEnabled {
-		// Configure controller that create virtualnodes from resourceslices.
-		vnCreatorReconciler := virtualnodecreatorcontroller.NewVirtualNodeCreatorReconciler(
-			mgr.GetClient(), mgr.GetScheme(), mgr.GetEventRecorderFor("virtualnodecreator-controller"))
-		if err := vnCreatorReconciler.SetupWithManager(mgr); err != nil {
-			return fmt.Errorf("unable to setup the virtualnodecreator reconciler: %w", err)
-		}
-
 		// Configure controller that create quotas from resourceslices.
 		quotaCreatorReconciler := quotacreatorcontroller.NewQuotaCreatorReconciler(
 			mgr.GetClient(), mgr.GetScheme(), mgr.GetEventRecorderFor("quotacreator-controller"),

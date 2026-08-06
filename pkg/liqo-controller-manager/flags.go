@@ -57,6 +57,9 @@ func InitFlags(flagset *pflag.FlagSet, opts *Options) {
 		"The timeout of the ForeignCluster API server readiness check")
 	flagset.StringVar(&opts.DefaultLimitsEnforcement, "default-limits-enforcement", "none",
 		"Defines how strict is the enforcement of the quota offered by the remote cluster. Possible values are: none, soft, hard")
+	flagset.StringSliceVar(&opts.LocalPodCIDRs, "podcidr", nil, "The CIDRs to use for the pod network")
+	flagset.StringVar(&opts.VkOptionsDefaultTemplate, "vk-options-default-template", "",
+		"Namespaced name of the default VkOptionsTemplate used when a VirtualNode does not specify one (namespace/name)")
 
 	// Networking module
 	flagset.StringVar(&opts.IPAMServer, "ipam-server", "", "The address of the IPAM server (set to empty string to disable IPAM)")

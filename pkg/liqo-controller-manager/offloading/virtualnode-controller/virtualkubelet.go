@@ -21,11 +21,10 @@ import (
 	"encoding/json"
 	"fmt"
 
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
 	k8strings "k8s.io/utils/strings"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -96,13 +95,14 @@ func (r *VirtualNodeReconciler) ensureVirtualKubeletDeploymentPresence(
 	klog.V(5).Infof("[%v] ClusterRoleBinding %s reconciled: %s",
 		remoteClusterID, vkClusterRoleBinding.Name, op)
 
-	// forge the virtual Kubelet Deployment
-	vkDeployment := appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      virtualNode.Spec.Template.GetName(),
-			Namespace: virtualNode.Spec.Template.GetNamespace(),
-		},
+	// Fetch the VkOptionsTemplate referenced by the VirtualNode (or the default one).
+	vkOpts, err := r.getVkOptionsTemplate(ctx, virtualNode)
+	if err != nil {
+		return fmt.Errorf("unable to fetch the VkOptionsTemplate for virtual-node %q: %w", virtualNode.Name, err)
 	}
+
+	// Forge the virtual Kubelet Deployment directly from the VirtualNode and the VkOptionsTemplate.
+	vkDeployment := vkforge.VirtualKubeletDeployment(r.HomeClusterID, r.LiqoNamespace, r.LocalPodCIDRs, virtualNode, vkOpts)
 
 	// Retrieve the ForeignCluster to check whether networking is enabled for the remote cluster.
 	fc, err := foreigncluster.GetForeignClusterByID(ctx, r.Client, virtualNode.Spec.ClusterID)
@@ -119,18 +119,14 @@ func (r *VirtualNodeReconciler) ensureVirtualKubeletDeploymentPresence(
 		}
 	}
 
-	op, err = resource.CreateOrUpdate(ctx, r.Client, &vkDeployment, func() error {
-		vkDeployment.Annotations = labels.Merge(vkDeployment.Annotations, virtualNode.Spec.Template.ObjectMeta.GetAnnotations())
-		vkDeployment.Labels = labels.Merge(vkDeployment.Labels, virtualNode.Spec.Template.ObjectMeta.GetLabels())
-
-		vkDeployment.Spec = *virtualNode.Spec.Template.Spec.DeepCopy()
-
+	// CreateOrUpdate the Deployment using the forged deployment as the desired state.
+	op, err = resource.CreateOrUpdate(ctx, r.Client, vkDeployment, func() error {
 		if cfg != nil && len(vkDeployment.Spec.Template.Spec.Containers) > 0 {
 			vkDeployment.Spec.Template.Spec.Containers[0].Args =
 				vkforge.SetNetworkConfigurationArgs(vkDeployment.Spec.Template.Spec.Containers[0].Args, cfg)
 		}
 
-		// Add the hash of the offloading patch as annotation
+		// Add the hash of the offloading patch as annotation.
 		opHash, err := offloadingPatchHash(virtualNode.Spec.OffloadingPatch)
 		if err != nil {
 			return err
@@ -212,6 +208,39 @@ func (r *VirtualNodeReconciler) ensureVirtualKubeletDeploymentAbsence(
 	}
 
 	return nil
+}
+
+// getVkOptionsTemplate fetches the VkOptionsTemplate referenced by the VirtualNode, or the default
+// one configured on the reconciler if the VirtualNode does not specify a reference. It also defaults
+// the VirtualNode CreateNode and DisableNetworkCheck fields from the template (mirroring the
+// removed webhook behavior) so the VN spec is self-describing.
+func (r *VirtualNodeReconciler) getVkOptionsTemplate(ctx context.Context,
+	virtualNode *offloadingv1beta1.VirtualNode) (*offloadingv1beta1.VkOptionsTemplate, error) {
+	ref := r.VkOptionsDefaultTemplate
+	if virtualNode.Spec.VkOptionsTemplateRef != nil {
+		ref = virtualNode.Spec.VkOptionsTemplateRef
+	}
+	if ref == nil {
+		return nil, fmt.Errorf("no VkOptionsTemplate reference configured for virtual-node %q and no default set", virtualNode.Name)
+	}
+
+	var vkOpts offloadingv1beta1.VkOptionsTemplate
+	if err := r.Get(ctx, types.NamespacedName{Namespace: ref.Namespace, Name: ref.Name}, &vkOpts); err != nil {
+		return nil, err
+	}
+
+	// Default CreateNode and DisableNetworkCheck from the template if not set on the VirtualNode.
+	// This mirrors the defaulting previously performed by the mutating webhook.
+	if virtualNode.Spec.CreateNode == nil {
+		createNode := vkOpts.Spec.CreateNode
+		virtualNode.Spec.CreateNode = &createNode
+	}
+	if virtualNode.Spec.DisableNetworkCheck == nil {
+		disableNetworkCheck := vkOpts.Spec.DisableNetworkCheck
+		virtualNode.Spec.DisableNetworkCheck = &disableNetworkCheck
+	}
+
+	return &vkOpts, nil
 }
 
 func offloadingPatchHash(offloadingPatch *offloadingv1beta1.OffloadingPatch) (string, error) {

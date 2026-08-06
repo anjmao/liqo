@@ -104,38 +104,12 @@ func ForgeFakeVirtualNode(nameVirtualNode, tenantNamespaceName string,
 			},
 		},
 		Spec: offloadingv1beta1.VirtualNodeSpec{
-			ClusterID:  remoteClusterID,
-			CreateNode: ptr.To(true),
-			Template: &offloadingv1beta1.DeploymentTemplate{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      nameVirtualNode,
-					Namespace: tenantNamespaceName,
-					Labels: map[string]string{
-						"virtual-node": nameVirtualNode,
-					},
-				},
-				Spec: appsv1.DeploymentSpec{
-					Selector: &metav1.LabelSelector{
-						MatchLabels: map[string]string{
-							"virtual-node": nameVirtualNode,
-						},
-					},
-					Template: corev1.PodTemplateSpec{
-						ObjectMeta: metav1.ObjectMeta{
-							Labels: map[string]string{
-								"virtual-node": nameVirtualNode,
-							},
-						},
-						Spec: corev1.PodSpec{
-							Containers: []corev1.Container{
-								{
-									Name:  "virtual-kubelet",
-									Image: "virtual-kubelet-image",
-								},
-							},
-						},
-					},
-				},
+			ClusterID:           remoteClusterID,
+			CreateNode:          ptr.To(true),
+			DisableNetworkCheck: ptr.To(false),
+			VkOptionsTemplateRef: &corev1.ObjectReference{
+				Name:      "vk-default",
+				Namespace: "default",
 			},
 		},
 	}

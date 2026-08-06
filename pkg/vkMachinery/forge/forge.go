@@ -173,16 +173,52 @@ func forgeVKContainers(
 
 func forgeVKPodSpec(vkNamespace string, homeCluster liqov1beta1.ClusterID, liqoNamespace string, localPodCIDRs []string,
 	virtualNode *offloadingv1beta1.VirtualNode, opts *offloadingv1beta1.VkOptionsTemplate) v1.PodSpec {
+	containers := forgeVKContainers(
+		homeCluster, virtualNode.Spec.ClusterID,
+		virtualNode.Name, vkNamespace, liqoNamespace, localPodCIDRs,
+		virtualNode.Spec.StorageClasses, virtualNode.Spec.IngressClasses, virtualNode.Spec.LoadBalancerClasses,
+		opts)
+
+	// Inject the VirtualNode-spec-derived args (kubeconfig secret, create-node, node-check-network).
+	// These were previously injected by the mutating webhook into the stored deployment template.
+	if len(containers) > 0 {
+		containers[0].Args = appendVirtualNodeArgs(containers[0].Args, virtualNode)
+	}
+
 	return v1.PodSpec{
-		Containers: forgeVKContainers(
-			homeCluster, virtualNode.Spec.ClusterID,
-			virtualNode.Name, vkNamespace, liqoNamespace, localPodCIDRs,
-			virtualNode.Spec.StorageClasses, virtualNode.Spec.IngressClasses, virtualNode.Spec.LoadBalancerClasses,
-			opts),
+		Containers:         containers,
 		ServiceAccountName: virtualNode.Name,
 		ImagePullSecrets:   opts.Spec.ImagePullSecrets,
 		Tolerations:        opts.Spec.Tolerations,
 	}
+}
+
+// appendVirtualNodeArgs appends (or updates) the VirtualNode-spec-derived container args:
+// --foreign-kubeconfig-secret-name, --create-node, --node-check-network.
+func appendVirtualNodeArgs(args []string, virtualNode *offloadingv1beta1.VirtualNode) []string {
+	if virtualNode.Spec.KubeconfigSecretRef != nil {
+		args = setOrAppendArg(args, string(ForeignClusterKubeconfigSecretName), virtualNode.Spec.KubeconfigSecretRef.Name)
+	}
+	if virtualNode.Spec.CreateNode != nil {
+		args = setOrAppendArg(args, string(CreateNode), strconv.FormatBool(*virtualNode.Spec.CreateNode))
+	}
+	if virtualNode.Spec.DisableNetworkCheck != nil {
+		args = setOrAppendArg(args, string(NodeCheckNetwork), strconv.FormatBool(!*virtualNode.Spec.DisableNetworkCheck))
+	}
+	return args
+}
+
+// setOrAppendArg sets the value of an argument (key=value), replacing the existing one if present,
+// or appending a new one if not.
+func setOrAppendArg(args []string, key, value string) []string {
+	argVal := StringifyArgument(key, value)
+	for i, arg := range args {
+		if strings.HasPrefix(arg, key+"=") || arg == key {
+			args[i] = argVal
+			return args
+		}
+	}
+	return append(args, argVal)
 }
 
 func appendArgsReflectorsWorkers(args []string, reflectorsConfig map[string]offloadingv1beta1.ReflectorConfig) []string {

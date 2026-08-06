@@ -130,6 +130,9 @@ var _ = BeforeSuite(func() {
 		k8sManager.GetEventRecorderFor("virtualnode-controller"),
 		localID,
 		namespaceManager,
+		"default",
+		[]string{"10.0.0.0/16"},
+		&corev1.ObjectReference{Name: "vk-default", Namespace: "default"},
 	)
 	Expect(err).ToNot(HaveOccurred())
 
@@ -142,6 +145,22 @@ var _ = BeforeSuite(func() {
 	}()
 
 	nms = &offloadingv1beta1.NamespaceMapList{}
+
+	// Create the default VkOptionsTemplate used by the test VirtualNodes.
+	vkOpts := &offloadingv1beta1.VkOptionsTemplate{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vk-default",
+			Namespace: "default",
+		},
+		Spec: offloadingv1beta1.VkOptionsTemplateSpec{
+			CreateNode:          true,
+			DisableNetworkCheck: false,
+			ContainerImage:      "virtual-kubelet-image",
+			MetricsEnabled:      false,
+		},
+	}
+	Expect(k8sClient.Create(ctx, vkOpts)).Should(Succeed())
+	DeferCleanup(func() { _ = k8sClient.Delete(ctx, vkOpts) })
 
 	// create the 2 tenant namespace
 	tenantNamespace1, err = namespaceManager.CreateNamespace(ctx, remoteClusterID1)

@@ -19,6 +19,7 @@ import (
 	"fmt"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -35,9 +36,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	authv1beta1 "github.com/liqotech/liqo/apis/authentication/v1beta1"
 	liqov1beta1 "github.com/liqotech/liqo/apis/core/v1beta1"
 	networkingv1beta1 "github.com/liqotech/liqo/apis/networking/v1beta1"
 	offloadingv1beta1 "github.com/liqotech/liqo/apis/offloading/v1beta1"
+	"github.com/liqotech/liqo/internal/crdReplicator/reflection"
 	"github.com/liqotech/liqo/pkg/consts"
 	tenantnamespace "github.com/liqotech/liqo/pkg/tenantNamespace"
 	"github.com/liqotech/liqo/pkg/utils/getters"
@@ -49,7 +52,9 @@ const (
 	virtualNodeControllerFinalizer = "virtualnode-controller.liqo.io/finalizer"
 )
 
-// VirtualNodeReconciler manage NamespaceMap lifecycle.
+// VirtualNodeReconciler manages the VirtualNode lifecycle: it creates VirtualNodes from
+// ResourceSlices, forges the child VirtualKubelet Deployment from the VirtualNode and the
+// referenced VkOptionsTemplate, and manages node/namespace cleanup.
 type VirtualNodeReconciler struct {
 	client.Client
 	Scheme         *runtime.Scheme
@@ -58,6 +63,14 @@ type VirtualNodeReconciler struct {
 	HomeClusterID    liqov1beta1.ClusterID
 	namespaceManager tenantnamespace.Manager
 	dr               *DeletionRoutine
+
+	// LiqoNamespace is the namespace where the liqo control plane components are running.
+	LiqoNamespace string
+	// LocalPodCIDRs is the list of local pod CIDRs, used to forge the VirtualKubelet deployment args.
+	LocalPodCIDRs []string
+	// VkOptionsDefaultTemplate is the default VkOptionsTemplate reference used when a VirtualNode
+	// does not specify one. Mirrors the removed webhook defaulting behavior.
+	VkOptionsDefaultTemplate *corev1.ObjectReference
 }
 
 // NewVirtualNodeReconciler returns a new VirtualNodeReconciler.
@@ -67,14 +80,20 @@ func NewVirtualNodeReconciler(
 	s *runtime.Scheme, er record.EventRecorder,
 	hci liqov1beta1.ClusterID,
 	namespaceManager tenantnamespace.Manager,
+	liqoNamespace string,
+	localPodCIDRs []string,
+	vkOptionsDefaultTemplate *corev1.ObjectReference,
 ) (*VirtualNodeReconciler, error) {
 	vnr := &VirtualNodeReconciler{
 		Client:         cl,
 		Scheme:         s,
 		EventsRecorder: er,
 
-		HomeClusterID:    hci,
-		namespaceManager: namespaceManager,
+		HomeClusterID:            hci,
+		namespaceManager:         namespaceManager,
+		LiqoNamespace:            liqoNamespace,
+		LocalPodCIDRs:            localPodCIDRs,
+		VkOptionsDefaultTemplate: vkOptionsDefaultTemplate,
 	}
 	var err error
 	vnr.dr, err = RunDeletionRoutine(ctx, vnr)
@@ -89,20 +108,27 @@ func NewVirtualNodeReconciler(
 // +kubebuilder:rbac:groups=offloading.liqo.io,resources=virtualnodes,verbs=get;list;watch;delete;create;update;patch
 // +kubebuilder:rbac:groups=offloading.liqo.io,resources=virtualnodes/status,verbs=get;list;watch;delete;create;update;patch
 // +kubebuilder:rbac:groups=offloading.liqo.io,resources=virtualnodes/finalizers,verbs=get;list;watch;delete;create;update;patch
+// +kubebuilder:rbac:groups=offloading.liqo.io,resources=vkoptionstemplates,verbs=get;list;watch
 // +kubebuilder:rbac:groups=offloading.liqo.io,resources=namespacemaps,verbs=get;list;watch;delete;create
 // +kubebuilder:rbac:groups=networking.liqo.io,resources=configurations,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core.liqo.io,resources=foreignclusters,verbs=get;list;watch
+// +kubebuilder:rbac:groups=authentication.liqo.io,resources=resourceslices,verbs=get;list;watch
+// +kubebuilder:rbac:groups=authentication.liqo.io,resources=identities,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=namespaces,verbs=get;list;watch;
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;delete;create;update;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;delete;create;update;patch
 // +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;delete;create;update;patch
 
 // Reconcile manage NamespaceMaps associated with the virtual-node.
 func (r *VirtualNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	// First try to fetch a VirtualNode with the requested name/namespace.
 	virtualNode := &offloadingv1beta1.VirtualNode{}
 	if err := r.Get(ctx, req.NamespacedName, virtualNode); err != nil {
 		if apierrors.IsNotFound(err) {
-			klog.Infof("There is no virtual-node called %q in %q", req.Name, req.Namespace)
-			return ctrl.Result{}, nil
+			// No VirtualNode with this key: it may be a ResourceSlice reconcile request (the
+			// ResourceSlice and the VirtualNode share the same name/namespace, since the VN is
+			// created with the same name as the originating ResourceSlice).
+			return r.reconcileResourceSlice(ctx, req)
 		}
 		return ctrl.Result{}, fmt.Errorf("unable to get the virtual-node %q: %w", req.NamespacedName, err)
 	}
@@ -225,6 +251,50 @@ func (r *VirtualNodeReconciler) enqueueVirtualNodesByClusterID(ctx context.Conte
 	return requests
 }
 
+// enqueueVirtualNodesFromVkOptionsTemplate enqueues reconcile requests for all VirtualNodes that
+// reference a given VkOptionsTemplate (explicitly or via the default ref), so that template
+// changes propagate to the deployments.
+func (r *VirtualNodeReconciler) enqueueVirtualNodesFromVkOptionsTemplate() handler.EventHandler {
+	return handler.EnqueueRequestsFromMapFunc(
+		func(ctx context.Context, o client.Object) []reconcile.Request {
+			vkOpts, ok := o.(*offloadingv1beta1.VkOptionsTemplate)
+			if !ok {
+				return []reconcile.Request{}
+			}
+
+			var vnList offloadingv1beta1.VirtualNodeList
+			if err := r.List(ctx, &vnList); err != nil {
+				klog.Errorf("unable to list virtualnodes for vkoptionstemplate %q: %v", vkOpts.Name, err)
+				return []reconcile.Request{}
+			}
+
+			var requests []reconcile.Request
+			for i := range vnList.Items {
+				vn := &vnList.Items[i]
+				if virtualNodeUsesTemplate(vn, vkOpts, r.VkOptionsDefaultTemplate) {
+					requests = append(requests, reconcile.Request{
+						NamespacedName: client.ObjectKeyFromObject(vn),
+					})
+				}
+			}
+			return requests
+		})
+}
+
+// virtualNodeUsesTemplate returns true if the VirtualNode references the given VkOptionsTemplate,
+// or if it has no ref and the template matches the configured default.
+func virtualNodeUsesTemplate(vn *offloadingv1beta1.VirtualNode, vkOpts *offloadingv1beta1.VkOptionsTemplate,
+	defaultRef *corev1.ObjectReference) bool {
+	if vn.Spec.VkOptionsTemplateRef != nil {
+		return vn.Spec.VkOptionsTemplateRef.Name == vkOpts.Name &&
+			vn.Spec.VkOptionsTemplateRef.Namespace == vkOpts.Namespace
+	}
+	if defaultRef != nil {
+		return defaultRef.Name == vkOpts.Name && defaultRef.Namespace == vkOpts.Namespace
+	}
+	return false
+}
+
 // SetupWithManager register the VirtualNodeReconciler to the manager.
 func (r *VirtualNodeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// select virtual kubelet deployments only
@@ -235,11 +305,27 @@ func (r *VirtualNodeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		klog.Error(err)
 		return err
 	}
+
+	// Filter ResourceSlices created by the local cluster (using crdReplicator labels) and
+	// whose authentication and resources conditions are both accepted.
+	localResSliceFilter, err := predicate.LabelSelectorPredicate(reflection.LocalResourcesLabelSelector())
+	if err != nil {
+		klog.Error(err)
+		return err
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).Named(consts.CtrlVirtualNode).
 		For(&offloadingv1beta1.VirtualNode{}).
+		// VN owns the Deployment: automatic cleanup on VN deletion, and enqueues on deployment changes.
+		Owns(&appsv1.Deployment{}, builder.WithPredicates(deployPredicate)).
 		Watches(&appsv1.Deployment{}, deploymentHandler, builder.WithPredicates(deployPredicate)).
 		Watches(&offloadingv1beta1.NamespaceMap{}, r.enqueFromNamespaceMap()).
 		Watches(&networkingv1beta1.Configuration{}, r.enqueueFromConfiguration()).
 		Watches(&liqov1beta1.ForeignCluster{}, r.enqueueFromForeignCluster()).
+		// Watch ResourceSlices to create VirtualNodes from them.
+		Watches(&authv1beta1.ResourceSlice{}, r.enqueueFromResourceSlice(),
+			builder.WithPredicates(predicate.And(localResSliceFilter, resourceSliceConditionsAcceptedPredicate()))).
+		// Watch VkOptionsTemplates to react on template changes.
+		Watches(&offloadingv1beta1.VkOptionsTemplate{}, r.enqueueVirtualNodesFromVkOptionsTemplate()).
 		Complete(r)
 }

@@ -20,7 +20,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	authv1beta1 "github.com/liqotech/liqo/apis/authentication/v1beta1"
@@ -57,8 +56,14 @@ func VirtualNode(name, namespace string) *offloadingv1beta1.VirtualNode {
 }
 
 // MutateVirtualNode mutates a VirtualNode resource.
+//
+// Note: it no longer fetches the VkOptionsTemplate nor populates vn.Spec.Template. The VirtualKubelet
+// deployment is forged directly by the VirtualNodeReconciler from the VirtualNode and the referenced
+// VkOptionsTemplate at reconcile time.
 func MutateVirtualNode(ctx context.Context, cl client.Client, virtualNode *offloadingv1beta1.VirtualNode,
 	remoteClusterID liqov1beta1.ClusterID, opts *VirtualNodeOptions, createNode, disableNetworkCheck *bool, runtimeClassName *string) error {
+	_ = ctx
+	_ = cl
 	// VirtualNode metadata
 	if virtualNode.ObjectMeta.Labels == nil {
 		virtualNode.ObjectMeta.Labels = make(map[string]string)
@@ -102,20 +107,6 @@ func MutateVirtualNode(ctx context.Context, cl client.Client, virtualNode *offlo
 		}
 
 		virtualNode.Spec.OffloadingPatch.NodeSelector = opts.NodeSelector
-	}
-
-	vkOptionsTemplate := offloadingv1beta1.VkOptionsTemplate{}
-	if virtualNode.Spec.VkOptionsTemplateRef != nil {
-		if err := cl.Get(ctx, types.NamespacedName{
-			Namespace: virtualNode.Spec.VkOptionsTemplateRef.Namespace,
-			Name:      virtualNode.Spec.VkOptionsTemplateRef.Name,
-		}, &vkOptionsTemplate); err != nil {
-			return err
-		}
-
-		if virtualNode.Spec.Template.Spec.Replicas == nil {
-			virtualNode.Spec.Template.Spec.Replicas = vkOptionsTemplate.Spec.Replicas
-		}
 	}
 
 	return nil

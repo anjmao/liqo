@@ -42,6 +42,8 @@ type Options struct {
 	ForeignClusterPingInterval time.Duration
 	ForeignClusterPingTimeout  time.Duration
 	DefaultLimitsEnforcement   string
+	LocalPodCIDRs              []string
+	VkOptionsDefaultTemplate   string
 
 	// Networking module
 	IPAMServer                     string
